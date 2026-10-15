@@ -142,6 +142,64 @@ def find_supported_name(names: List[str], aliases: List[str]) -> Optional[str]:
     return None
 
 
+def _item_base_name(item: Any, iid_keys: tuple) -> str:
+    """Recover the spec type name before duplicate-name suffixing.
+
+    mijiaAPI's `_deduplicate_names` appends `-{siid}` and then `-{siid}-{iid}`
+    to names that collide across services or within a service. The suffix is
+    always built from the item's own method ids, so it can be stripped
+    deterministically (at most one suffix per pass).
+    """
+    name = str(getattr(item, "name", "") or "")
+    method = getattr(item, "method", None) or {}
+    siid = method.get("siid")
+    if siid is None:
+        return name
+    for _ in range(2):
+        stripped = None
+        for iid_key in iid_keys:
+            iid = method.get(iid_key)
+            suffix = f"-{siid}-{iid}" if iid is not None else None
+            if suffix and name.endswith(suffix):
+                stripped = name[: -len(suffix)]
+                break
+        if stripped is None and name.endswith(f"-{siid}"):
+            stripped = name[: -len(f"-{siid}")]
+        if stripped is None:
+            break
+        name = stripped
+    return name
+
+
+def property_base_name(prop: Any) -> str:
+    return _item_base_name(prop, ("piid",))
+
+
+def action_base_name(action: Any) -> str:
+    return _item_base_name(action, ("aiid",))
+
+
+# A capability only backs properties whose MIoT format is compatible with its
+# declared value type. Boolean is strict on purpose: enum properties such as a
+# cooker's `status` must never back a Power switch. Numeric and categorical
+# capabilities stay permissive because specs encode enumerations as int/uint.
+VALUE_TYPE_COMPATIBILITY: Dict[str, set] = {
+    "boolean": {"bool"},
+    "integer": {"int", "uint", "float"},
+    "float": {"int", "uint", "float"},
+    "string": {"string", "int", "uint"},
+}
+
+
+def is_value_type_compatible(prop: Any, value_type: Optional[str]) -> bool:
+    if not value_type:
+        return True
+    compatible = VALUE_TYPE_COMPATIBILITY.get(value_type)
+    if compatible is None:
+        return True
+    return str(getattr(prop, "type", "") or "") in compatible
+
+
 def is_property_readable(prop: Any) -> bool:
     access = str(getattr(prop, "rw", "") or "").lower()
     return "r" in access or not access
@@ -152,24 +210,41 @@ def is_property_writable(prop: Any) -> bool:
     return "w" in access
 
 
-def find_supported_property(properties: List[Any], aliases: List[str], writable_only: bool = False) -> Optional[Any]:
+def find_supported_property(
+    properties: List[Any],
+    aliases: List[str],
+    writable_only: bool = False,
+    value_type: Optional[str] = None,
+) -> Optional[Any]:
     candidates = properties if not writable_only else [prop for prop in properties if is_property_writable(prop)]
-    names = [getattr(prop, "name", "") for prop in candidates]
-    matched = find_supported_name(names, aliases)
+    if value_type:
+        candidates = [prop for prop in candidates if is_value_type_compatible(prop, value_type)]
+    matched = find_supported_name([getattr(prop, "name", "") for prop in candidates], aliases)
+    if matched:
+        for prop in candidates:
+            if getattr(prop, "name", None) == matched:
+                return prop
+    # Duplicate names are suffixed by the spec loader; fall back to base names
+    # so a renamed `on-2` can still back a capability aliased `on`.
+    matched = find_supported_name([property_base_name(prop) for prop in candidates], aliases)
     if not matched:
         return None
     for prop in candidates:
-        if getattr(prop, "name", None) == matched:
+        if property_base_name(prop) == matched:
             return prop
     return None
 
 
 def find_supported_action(actions: List[Any], aliases: List[str]) -> Optional[Any]:
-    names = [getattr(action, "name", "") for action in actions]
-    matched = find_supported_name(names, aliases)
+    matched = find_supported_name([getattr(action, "name", "") for action in actions], aliases)
+    if matched:
+        for action in actions:
+            if getattr(action, "name", None) == matched:
+                return action
+    matched = find_supported_name([action_base_name(action) for action in actions], aliases)
     if not matched:
         return None
     for action in actions:
-        if getattr(action, "name", None) == matched:
+        if action_base_name(action) == matched:
             return action
     return None

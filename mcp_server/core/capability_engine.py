@@ -4,7 +4,6 @@ from typing import Any, Dict, List
 
 from mcp_server.core.normalizers import (
     find_supported_action,
-    find_supported_name,
     find_supported_property,
     is_property_readable,
     is_property_writable,
@@ -35,8 +34,36 @@ def capability_matches_device(definition: Dict[str, Any], device: Dict[str, Any]
     return not device_type or device_type in supported_device_types
 
 
+def primary_service_items(items: List[Any]) -> List[Any]:
+    """Restrict spec items to the device's primary service.
+
+    MIOT spec instances order services so the primary function service carries
+    the lowest iid above the mandatory device-information service (iid 1).
+    Standard capabilities describe that primary function, so sub-service items
+    (cat-eye cameras, screens, indicator lights) must not back them even when
+    their names collide with a capability alias (e.g. a cat-eye's motion-record
+    `on` must never become the device's Power).
+    """
+    siids = []
+    for item in items:
+        siid = (getattr(item, "method", None) or {}).get("siid")
+        if isinstance(siid, int) and siid > 1:
+            siids.append(siid)
+    if not siids:
+        return list(items)
+    primary = min(siids)
+    scoped = [
+        item
+        for item in items
+        if (getattr(item, "method", None) or {}).get("siid") in (None, primary)
+    ]
+    return scoped or list(items)
+
+
 def infer_device_domains(device: Dict[str, Any], properties: List[Any], actions: List[Any]) -> List[str]:
     domains: List[str] = []
+    properties = primary_service_items(properties)
+    actions = primary_service_items(actions)
     for capability_name, definition in CAPABILITY_REGISTRY.items():
         capability_domains = definition.get("domains", [])
         if not capability_domains:
@@ -45,7 +72,9 @@ def infer_device_domains(device: Dict[str, Any], properties: List[Any], actions:
             continue
         matched = False
         if definition["kind"] == "property":
-            matched = find_supported_property(properties, definition["aliases"]) is not None
+            matched = find_supported_property(
+                properties, definition["aliases"], value_type=definition.get("value_type")
+            ) is not None
         elif definition["kind"] == "action":
             matched = find_supported_action(actions, definition["aliases"]) is not None
         if matched:
@@ -81,15 +110,22 @@ def get_action_target(action: Any, target_kind: str) -> Dict[str, Any]:
 
 def build_device_capability_profile(device: Dict[str, Any], properties: List[Any], actions: List[Any]) -> Dict[str, Any]:
     controls: Dict[str, Dict[str, Any]] = {}
+    primary_properties = primary_service_items(properties)
+    primary_actions = primary_service_items(actions)
     for capability_name, definition in CAPABILITY_REGISTRY.items():
         if not capability_matches_device(definition, device):
             continue
         if definition["kind"] == "property":
-            prop = find_supported_property(properties, definition["aliases"], writable_only=True)
+            prop = find_supported_property(
+                primary_properties,
+                definition["aliases"],
+                writable_only=True,
+                value_type=definition.get("value_type"),
+            )
             if prop:
                 controls[capability_name] = get_capability_target(prop, capability_name)
         elif definition["kind"] == "action":
-            action = find_supported_action(actions, definition["aliases"])
+            action = find_supported_action(primary_actions, definition["aliases"])
             if action:
                 controls[capability_name] = get_action_target(action, capability_name)
 
@@ -404,8 +440,8 @@ def describe_supported_operations(supported_operations: Dict[str, bool]) -> List
 
 
 def summarize_capabilities(properties: List[Any], actions: List[Any]) -> Dict[str, Any]:
-    property_names = [getattr(prop, "name", "") for prop in properties]
-    action_names = [getattr(action, "name", "") for action in actions]
+    primary_properties = primary_service_items(properties)
+    primary_actions = primary_service_items(actions)
 
     support_summary: Dict[str, Any] = {
         "properties": [normalize_property(prop) for prop in properties],
@@ -414,8 +450,10 @@ def summarize_capabilities(properties: List[Any], actions: List[Any]) -> Dict[st
     for capability_name, definition in CAPABILITY_REGISTRY.items():
         supported = False
         if definition["kind"] == "property":
-            supported = find_supported_name(property_names, definition["aliases"]) is not None
+            supported = find_supported_property(
+                primary_properties, definition["aliases"], value_type=definition.get("value_type")
+            ) is not None
         elif definition["kind"] == "action":
-            supported = find_supported_name(action_names, definition["aliases"]) is not None
+            supported = find_supported_action(primary_actions, definition["aliases"]) is not None
         support_summary[f"supports_{capability_name}"] = supported
     return support_summary
